@@ -9,7 +9,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execFile, exec } = require('child_process');
+const { execFile } = require('child_process');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const baileys = require('baileys');
@@ -36,7 +36,7 @@ app.use(express.static(BOT_DIR));
 
 let activeSocket = null;
 let activeSessionState = {
-  status: 'idle', // 'idle' | 'generating' | 'qr' | 'pairing' | 'connected' | 'error'
+  status: 'idle',
   pairingCode: null,
   qrCodeUrl: null,
   message: '',
@@ -107,122 +107,157 @@ function writeEnvConfig(updates) {
   fs.writeFileSync(CONFIG_FILE, lines.join('\n') + '\n', 'utf8');
 }
 
-async function startBaileysSocket(sessionId = 'AcMods', mode = 'qr', phoneNumber = null) {
+async function startQrSession(sessionId = 'AcMods') {
   cleanupSocket();
   const safeId = (sessionId || 'AcMods').replace(/[^a-zA-Z0-9_-]/g, '');
   const sessionDir = getSessionPath(safeId);
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+  if (fs.existsSync(sessionDir)) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
   activeSessionState = {
     status: 'generating',
     pairingCode: null,
     qrCodeUrl: null,
-    message: mode === 'pairing' ? 'جارِ طلب رمز الاقتران...' : 'جارِ توليد رمز QR...',
+    message: 'جارِ توليد رمز QR...',
     sessionId: safeId,
     updatedAt: new Date().toISOString()
   };
 
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
-    const logger = pino({ level: 'silent' });
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    logger: pino({ level: 'silent' }),
+    browser: Browsers.ubuntu('Chrome'),
+    syncFullHistory: false,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000
+  });
 
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false,
-      logger,
-      browser: Browsers.ubuntu('Chrome'),
-      syncFullHistory: false,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000
-    });
+  activeSocket = sock;
+  sock.ev.on('creds.update', saveCreds);
 
-    activeSocket = sock;
-    sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, qr, lastDisconnect } = update;
 
-    if (mode === 'pairing' && phoneNumber) {
-      setTimeout(async () => {
-        try {
-          const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-          if (!sock.authState.creds.registered) {
-            const code = await sock.requestPairingCode(cleanPhone);
-            activeSessionState = {
-              status: 'pairing',
-              pairingCode: code,
-              qrCodeUrl: null,
-              message: `رمز الاقتران: ${code}`,
-              sessionId: safeId,
-              updatedAt: new Date().toISOString()
-            };
-          }
-        } catch (err) {
-          activeSessionState = {
-            status: 'error',
-            pairingCode: null,
-            qrCodeUrl: null,
-            message: `فشل طلب رمز الاقتران: ${err.message}`,
-            sessionId: safeId,
-            updatedAt: new Date().toISOString()
-          };
-        }
-      }, 2000);
-    }
-
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, qr, lastDisconnect } = update;
-
-      if (qr && mode === 'qr') {
-        try {
-          const qrUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
-          activeSessionState = {
-            status: 'qr',
-            pairingCode: null,
-            qrCodeUrl: qrUrl,
-            message: 'امسح رمز QR للمتابعة',
-            sessionId: safeId,
-            updatedAt: new Date().toISOString()
-          };
-        } catch (_) {}
-      }
-
-      if (connection === 'open') {
+    if (qr) {
+      try {
+        const qrUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 7 });
         activeSessionState = {
-          status: 'connected',
+          status: 'qr',
           pairingCode: null,
-          qrCodeUrl: null,
-          message: 'تم الربط بنجاح! جارِ تشغيل البوت...',
+          qrCodeUrl: qrUrl,
+          message: 'امسح رمز QR للمتابعة',
           sessionId: safeId,
           updatedAt: new Date().toISOString()
         };
+      } catch (_) {}
+    }
 
-        await delay(2000);
+    if (connection === 'open') {
+      activeSessionState = {
+        status: 'connected',
+        pairingCode: null,
+        qrCodeUrl: null,
+        message: 'تم الربط بنجاح! جارِ تشغيل البوت...',
+        sessionId: safeId,
+        updatedAt: new Date().toISOString()
+      };
+
+      await delay(2000);
+      cleanupSocket();
+
+      try {
+        await execPm2(['restart', BOT_PROCESS]);
+      } catch (_) {}
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      if (statusCode === DisconnectReason.loggedOut) {
+        activeSessionState.status = 'idle';
         cleanupSocket();
-
-        // Restart bot PM2 process
-        try {
-          await execPm2(['restart', BOT_PROCESS]);
-        } catch (_) {}
       }
+    }
+  });
+}
 
-      if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        if (statusCode === DisconnectReason.loggedOut) {
-          activeSessionState.status = 'idle';
-          cleanupSocket();
-        }
-      }
-    });
-  } catch (err) {
-    activeSessionState = {
-      status: 'error',
-      pairingCode: null,
-      qrCodeUrl: null,
-      message: err.message,
-      sessionId: safeId,
-      updatedAt: new Date().toISOString()
-    };
+async function startPairingSession(sessionId = 'AcMods', phoneNumber) {
+  cleanupSocket();
+  const safeId = (sessionId || 'AcMods').replace(/[^a-zA-Z0-9_-]/g, '');
+  const sessionDir = getSessionPath(safeId);
+
+  if (fs.existsSync(sessionDir)) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
   }
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    logger: pino({ level: 'silent' }),
+    browser: Browsers.ubuntu('Chrome'),
+    syncFullHistory: false,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000
+  });
+
+  activeSocket = sock;
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === 'open') {
+      activeSessionState = {
+        status: 'connected',
+        pairingCode: null,
+        qrCodeUrl: null,
+        message: 'تم الربط بنجاح! جارِ تشغيل البوت...',
+        sessionId: safeId,
+        updatedAt: new Date().toISOString()
+      };
+
+      await delay(2000);
+      cleanupSocket();
+
+      try {
+        await execPm2(['restart', BOT_PROCESS]);
+      } catch (_) {}
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      if (statusCode === DisconnectReason.loggedOut) {
+        activeSessionState.status = 'idle';
+        cleanupSocket();
+      }
+    }
+  });
+
+  await delay(1500);
+  const code = await sock.requestPairingCode(phoneNumber);
+
+  activeSessionState = {
+    status: 'pairing',
+    pairingCode: code,
+    qrCodeUrl: null,
+    message: `رمز الاقتران: ${code}`,
+    sessionId: safeId,
+    updatedAt: new Date().toISOString()
+  };
+
+  return code;
 }
 
 // ── API Routes ──────────────────────────────────────────────────────────────
@@ -275,30 +310,25 @@ app.get('/api/status', async (req, res) => {
 
 app.post('/api/start-qr', async (req, res) => {
   const { sessionId = 'AcMods' } = req.body || {};
-  await startBaileysSocket(sessionId, 'qr');
-  res.json({ success: true, sessionState: activeSessionState });
+  try {
+    await startQrSession(sessionId);
+    res.json({ success: true, sessionState: activeSessionState });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post('/api/start-pairing', async (req, res) => {
-  const { sessionId = 'AcMods', phoneNumber } = req.body || {};
-  if (!phoneNumber) {
-    return res.status(400).json({ success: false, error: 'رقم الهاتف مطلوب' });
-  }
-  await startBaileysSocket(sessionId, 'pairing', phoneNumber);
-  
-  // Wait up to 5 seconds for pairingCode to generate
-  let attempts = 0;
-  while (attempts < 10 && !activeSessionState.pairingCode && activeSessionState.status !== 'error') {
-    await delay(500);
-    attempts++;
-  }
-
-  if (activeSessionState.pairingCode) {
-    res.json({ success: true, pairingCode: activeSessionState.pairingCode, sessionState: activeSessionState });
-  } else if (activeSessionState.status === 'error') {
-    res.status(500).json({ success: false, error: activeSessionState.message });
-  } else {
-    res.json({ success: true, message: 'جارِ توليد الرمز...', sessionState: activeSessionState });
+  try {
+    const { sessionId = 'AcMods', phoneNumber } = req.body || {};
+    if (!phoneNumber) {
+      return res.status(400).json({ success: false, error: 'رقم الهاتف مطلوب' });
+    }
+    const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
+    const code = await startPairingSession(sessionId, cleanPhone);
+    res.json({ success: true, pairingCode: code, sessionState: activeSessionState });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -410,6 +440,12 @@ app.post('/api/logs/clear', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Global fallback error handler to always return JSON
+app.use((err, req, res, next) => {
+  console.error('Unhandled Dashboard Error:', err);
+  res.status(500).json({ success: false, error: err.message || 'Internal Server Error' });
 });
 
 app.listen(PORT, () => {
